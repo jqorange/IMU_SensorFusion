@@ -1,0 +1,25 @@
+# MATLAB-compatible signal settings.
+sample_rate_hz: 100.0
+raw_sample_rate_hz: 1250.0
+channel_count: 16
+# MATLAB channel indices 2:10, written here as one-based channel numbers.
+imu_channels_one_based: [2, 3, 4, 5, 6, 7, 8, 9, 10]
+clip_percentiles: [0.1, 99.9]
+calibrate: true
+
+# MATLAB ahrsfilter is proprietary. EKF is the closest MARG filter supplied by
+# the Python `ahrs` package. See docs/matlab_equivalence.md.
+ahrs_algorithm: ekf
+reference_frame: NED
+
+# Fixed B' -> B mapping requested for this project. Orientation is transformed
+# as R_aligned = R_original @ sensor_axis_mapping.
+sensor_axis_mapping:
+  - [0.0, 0.0, 1.0]
+  - [-1.0, 0.0, 0.0]
+  - [0.0, -1.0, 0.0]
+
+drift_window_samples: 50
+drift_threshold_degrees: 300.0
+speed_highpass_hz: 0.1
+speed_highpass_order: 2
