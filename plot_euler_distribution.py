@@ -17,9 +17,6 @@ from pathlib import Path
 # User configuration
 # =============================================================================
 
-# Native fusion HDF5 or a legacy CSV with roll, yaw, and pitch columns.
-FUSION_RESULT_FILE = Path(r"D:\Jiaqi\tools\9_axies_IMU\output\fusion_result.h5")
-
 # Histogram bins per revolution. A value of 144 gives 2.5 degrees per bin.
 NUMBER_OF_BINS = 144
 
@@ -171,7 +168,12 @@ def main() -> Path | None:
 
     import matplotlib.pyplot as plt
 
-    source_path = _resolve_project_path(project_root, FUSION_RESULT_FILE)
+    from imu_fusion.config import ACTIVE_SESSION
+    from imu_fusion.sessions import resolve_session
+
+    session = resolve_session(ACTIVE_SESSION, project_root)
+    source_path = session.fusion_result_file
+    print(f"Active session: {session.name}", flush=True)
     print(f"Reading Euler angles: {source_path}", flush=True)
     euler = _load_euler_angles(source_path)
     print(f"Loaded {len(euler):,} samples. Plotting...", flush=True)

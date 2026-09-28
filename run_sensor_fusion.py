@@ -20,14 +20,6 @@ from time import perf_counter
 # User configuration
 # =============================================================================
 
-# Preferred input: a start-aligned 100 Hz nine-axis IMU file.
-ALIGNED_IMU_FILE = Path(
-    r"D:\Jiaqi\tools\9_axies_IMU\prepared_sessions\day5.animal.behavior_corrected\session_01\aligned_imu_100hz.h5"
-)
-
-# Fusion output. Missing parent directories are created automatically.
-FUSION_OUTPUT_FILE = Path("output/fusion_result.h5")
-
 # Keep False for prepared input. Set True to prepare a raw 16-channel file.
 PREPARE_FROM_ANALOG = False
 
@@ -119,14 +111,17 @@ def main() -> Path:
     # Import only after environment bootstrapping. This lets any system Python
     # start the entry file even when scientific packages are installed only in
     # the local .venv.
-    from imu_fusion.config import FusionConfig
+    from imu_fusion.config import ACTIVE_SESSION, FusionConfig
     from imu_fusion.io import read_aligned_imu, write_aligned_imu
     from imu_fusion.pipeline import fuse_aligned_imu
     from imu_fusion.prepare import prepare_aligned_segment
+    from imu_fusion.sessions import resolve_session
 
     # Direct-run mode has one source of truth: src/imu_fusion/config.py.
-    # In particular, FusionConfig() uses _DEFAULT_MAPPING from that file.
+    # FusionConfig uses _DEFAULT_MAPPING and ACTIVE_SESSION selects all files.
     config = FusionConfig()
+    session = resolve_session(ACTIVE_SESSION, project_root)
+    print(f"Active session: {session.name}", flush=True)
     input_started = perf_counter()
 
     if PREPARE_FROM_ANALOG:
@@ -142,12 +137,17 @@ def main() -> Path:
         write_aligned_imu(aligned_path, aligned_imu, config.sample_rate_hz)
         print(f"      Aligned IMU saved to: {aligned_path}")
     else:
-        aligned_path = _resolve_project_path(project_root, ALIGNED_IMU_FILE)
+        aligned_path = session.aligned_imu_file
+        if not aligned_path.is_file():
+            raise FileNotFoundError(
+                "Prepared IMU file does not exist for "
+                f"{session.name}: {aligned_path}"
+            )
         print(f"[1/2] Reading aligned IMU: {aligned_path}", flush=True)
         aligned_imu, _ = read_aligned_imu(aligned_path)
     input_seconds = perf_counter() - input_started
 
-    output_path = _resolve_project_path(project_root, FUSION_OUTPUT_FILE)
+    output_path = session.fusion_result_file
     print(
         f"[2/2] Running {config.ahrs_algorithm.upper()} sensor fusion...",
         flush=True,

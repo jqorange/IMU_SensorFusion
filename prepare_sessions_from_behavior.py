@@ -20,10 +20,18 @@ from pathlib import Path
 
 # Each path may be a day directory, a parent directory, or one behavior MAT.
 DATA_ROOTS = [
-    Path(r"D:\Jiaqi\Datasets\Dataset\Jiaqi_data\F3day5"),
+    Path(
+        r"I:\data\FieldRat\2024\F5\Merged\day10\121_day10\121_day10.animal.behavior_all.mat"
+    ),
 ]
 
 OUTPUT_ROOT = Path("prepared_sessions")
+
+# Maps each day's numbered recording folder to its experimental condition.
+SESSION_INFO_FILE = Path("config/session_labels.txt")
+
+# Prepare only the session currently used by the project entry points.
+INCLUDED_STANDARD_SESSIONS = ("F5D10_outdoor",)
 
 # A larger timestamp gap starts a new behavior session.
 SESSION_GAP_SECONDS = 60.0
@@ -92,6 +100,7 @@ def main() -> Path:
     from imu_fusion.session_preparation import (
         find_behavior_mats,
         prepare_behavior_day,
+        read_session_labels,
         write_table_h5,
     )
 
@@ -99,6 +108,8 @@ def main() -> Path:
     # preparation and sensor fusion cannot silently use different YAML values.
     config = FusionConfig()
     output_root = _absolute(project_root, OUTPUT_ROOT)
+    session_info_path = _absolute(project_root, SESSION_INFO_FILE)
+    session_labels = read_session_labels(session_info_path)
     behavior_files = sorted(
         {
             behavior
@@ -124,6 +135,8 @@ def main() -> Path:
             analog_priority=ANALOG_FILE_PRIORITY,
             overwrite=OVERWRITE_EXISTING,
             max_workers=per_day_workers,
+            session_labels=session_labels,
+            included_standard_sessions=INCLUDED_STANDARD_SESSIONS,
         )
         return behavior_file, manifest
 
@@ -159,6 +172,10 @@ def main() -> Path:
             output_root / "preparation_errors.h5",
             "errors",
         )
+    else:
+        stale_error_path = output_root / "preparation_errors.h5"
+        if stale_error_path.exists():
+            stale_error_path.unlink()
     if not manifests:
         raise RuntimeError("Every behavior file failed. See preparation_errors.h5.")
     print(f"Manifest: {manifest_path}", flush=True)

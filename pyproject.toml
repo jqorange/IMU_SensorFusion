@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "imu-fusion-python"
+version = "0.1.0"
+description = "Python port of the CE32 nine-axis IMU preprocessing and MARG fusion workflow"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "ahrs>=0.3.1,<0.4",
+  "h5py>=3.11,<4",
+  "numpy>=1.26,<3",
+  "pandas>=2.2,<3",
+  "scipy>=1.12,<2",
+]
+
+[project.optional-dependencies]
+viewer = [
+  "fast-simplification>=0.1.9,<1",
+  "opencv-python-headless>=4.9,<5",
+  "pyqtgraph>=0.13.7,<1",
+  "PySide6>=6.7,<7",
+  "scikit-image>=0.24,<1",
+  "trimesh>=4.4,<5",
+]
+plotting = ["matplotlib>=3.8,<4"]
+dev = ["pytest>=8,<9", "ruff>=0.5,<1"]
+
+[project.scripts]
+imu-fusion = "imu_fusion.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/imu_fusion"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

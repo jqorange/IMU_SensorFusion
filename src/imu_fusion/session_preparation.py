@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import h5py
 import numpy as np
@@ -40,6 +40,74 @@ class AnalogSource:
     path: Path
     folder: Path
     is_continuous_day_file: bool
+
+
+def read_session_labels(path: str | Path) -> dict[str, str]:
+    """Read and normalize ``F3Day5_1: outdoor`` session labels."""
+    source = Path(path)
+    labels: dict[str, str] = {}
+    pattern = re.compile(
+        r"^F(\d+)Day(\d+)_(\d+)\s*:\s*((?:indoor|outdoor)(?:_\d+)?)$",
+        flags=re.IGNORECASE,
+    )
+    for line_number, raw_line in enumerate(
+        source.read_text(encoding="utf-8-sig").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = pattern.fullmatch(line)
+        if match is None:
+            raise ValueError(
+                f"Invalid session label at {source}:{line_number}: {raw_line!r}"
+            )
+        key = f"F{int(match.group(1))}D{int(match.group(2))}_{int(match.group(3))}"
+        condition = match.group(4).lower()
+        if key in labels:
+            raise ValueError(f"Duplicate session label {key} in {source}.")
+        labels[key] = condition
+    if not labels:
+        raise ValueError(f"Session label file is empty: {source}")
+    return labels
+
+
+def parse_day_id(path: str | Path) -> str:
+    """Extract a normalized day ID such as ``F5D10`` from a path."""
+    source = Path(path)
+    animal_number: int | None = None
+    day_number: int | None = None
+    for candidate in (source, *source.parents):
+        match = re.search(r"F(\d+)Day(\d+)", candidate.name, flags=re.IGNORECASE)
+        if match is not None:
+            return f"F{int(match.group(1))}D{int(match.group(2))}"
+        animal_match = re.fullmatch(r"F(\d+)", candidate.name, flags=re.IGNORECASE)
+        day_match = re.fullmatch(r"day(\d+)", candidate.name, flags=re.IGNORECASE)
+        if animal_match is not None:
+            animal_number = int(animal_match.group(1))
+        if day_match is not None:
+            day_number = int(day_match.group(1))
+        if animal_number is not None and day_number is not None:
+            return f"F{animal_number}D{day_number}"
+    raise ValueError(f"Cannot determine an F#Day# identifier from {source}.")
+
+
+def _source_folder_index(source: AnalogSource) -> int | None:
+    """Return the numeric prefix of a per-session recording folder."""
+    match = re.match(r"^(\d+)_", source.folder.name)
+    return int(match.group(1)) if match is not None else None
+
+
+def _labels_for_day(
+    day_id: str, session_labels: Mapping[str, str]
+) -> list[tuple[int, str]]:
+    """Return configured folder indices and conditions for one day."""
+    prefix = f"{day_id}_"
+    selected = [
+        (int(key.removeprefix(prefix)), condition)
+        for key, condition in session_labels.items()
+        if key.startswith(prefix)
+    ]
+    return sorted(selected)
 
 
 def read_behavior_timestamps(mat_path: str | Path) -> np.ndarray:
@@ -107,7 +175,9 @@ def find_behavior_mats(root: str | Path) -> list[Path]:
 
 def _is_behavior_mat(path: Path) -> bool:
     lowered = path.name.lower()
-    return "behavior" in lowered and "corrected" in lowered
+    return "behavior" in lowered and (
+        "corrected" in lowered or lowered.endswith("behavior_all.mat")
+    )
 
 
 def discover_analog_sources(
@@ -201,6 +271,8 @@ def prepare_behavior_day(
     analog_priority: Sequence[str] = ("analogin.dat", "analogin2.dat"),
     overwrite: bool = False,
     max_workers: int = 1,
+    session_labels: Mapping[str, str] | None = None,
+    included_standard_sessions: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     """Prepare every matched session for one corrected behavior MAT file."""
     behavior_mat = Path(behavior_mat)
@@ -212,16 +284,56 @@ def prepare_behavior_day(
         raise FileNotFoundError(f"No analogin file found below {behavior_mat.parent}")
 
     continuous = len(sources) == 1 and sources[0].is_continuous_day_file
-    if not continuous and len(sources) < len(segments):
+    day_id = parse_day_id(behavior_mat) if session_labels is not None else ""
+    identities: list[tuple[int, str]] = []
+    if session_labels is not None:
+        configured = _labels_for_day(day_id, session_labels)
+        if not configured:
+            raise ValueError(f"Session label file has no entries for {day_id}.")
+        if continuous:
+            if len(configured) != len(segments):
+                raise ValueError(
+                    f"{day_id} has {len(segments)} behavior segments but "
+                    f"{len(configured)} configured session labels."
+                )
+            identities = configured
+        else:
+            condition_by_index = dict(configured)
+            sources = [
+                source
+                for source in sources
+                if _source_folder_index(source) in condition_by_index
+            ]
+            identities = [
+                (
+                    int(_source_folder_index(source)),  # type: ignore[arg-type]
+                    condition_by_index[int(_source_folder_index(source))],  # type: ignore[arg-type]
+                )
+                for source in sources
+            ]
+
+    source_count_invalid = (
+        len(sources) != len(segments)
+        if session_labels is not None
+        else len(sources) < len(segments)
+    )
+    if not continuous and source_count_invalid:
         raise ValueError(
-            f"Found {len(segments)} behavior sessions but only {len(sources)} "
+            f"Found {len(segments)} behavior sessions but {len(sources)} matching "
             f"analog session folders below {behavior_mat.parent}."
         )
 
     day_name = _safe_name(behavior_mat.stem)
-    jobs: list[tuple[BehaviorSegment, AnalogSource, float, Path]] = []
+    jobs: list[
+        tuple[BehaviorSegment, AnalogSource, float, Path, int | None, str | None]
+    ] = []
     for index, segment in enumerate(segments):
         source = sources[0] if continuous else sources[index]
+        if identities:
+            folder_index, condition = identities[index]
+        else:
+            folder_index = _source_folder_index(source)
+            condition = None
         start_offset = (
             segment.start_s if continuous else session_file_start_offset(source)
         )
@@ -231,12 +343,27 @@ def prepare_behavior_day(
             else f"session_{segment.index:02d}_{_safe_name(source.folder.name)}"
         )
         output_path = output_root / day_name / session_label / "aligned_imu_100hz.h5"
-        jobs.append((segment, source, start_offset, output_path))
+        jobs.append(
+            (segment, source, start_offset, output_path, folder_index, condition)
+        )
+
+    if included_standard_sessions is not None:
+        included = {name.lower() for name in included_standard_sessions}
+        jobs = [
+            job
+            for job in jobs
+            if job[5] is not None and f"{day_id}_{job[5]}".lower() in included
+        ]
+        if not jobs:
+            requested = ", ".join(included_standard_sessions)
+            raise ValueError(
+                f"No prepared session for {day_id} matches requested names: {requested}"
+            )
 
     def prepare_job(
-        job: tuple[BehaviorSegment, AnalogSource, float, Path],
+        job: tuple[BehaviorSegment, AnalogSource, float, Path, int | None, str | None],
     ) -> dict[str, object]:
-        segment, source, start_offset, output_path = job
+        segment, source, start_offset, output_path, folder_index, condition = job
         status = "skipped_existing"
         if overwrite or not output_path.exists():
             aligned = prepare_aligned_segment(
@@ -249,6 +376,12 @@ def prepare_behavior_day(
             status = "prepared"
         return {
             "session_index": segment.index,
+            "day_id": day_id,
+            "source_folder_index": folder_index,
+            "condition": condition or "",
+            "standard_session_name": (
+                f"{day_id}_{condition}" if condition is not None else ""
+            ),
             "behavior_mat": str(behavior_mat),
             "analog_file": str(source.path),
             "behavior_start_s": segment.start_s,

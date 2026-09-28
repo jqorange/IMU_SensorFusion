@@ -2,7 +2,12 @@ from pathlib import Path
 
 import numpy as np
 
-from imu_fusion.io import read_aligned_imu, read_fusion_result, write_aligned_imu
+from imu_fusion.io import (
+    read_aligned_imu,
+    read_fusion_result,
+    read_fusion_view_data,
+    write_aligned_imu,
+)
 from imu_fusion.pipeline import FusionResult
 
 
@@ -31,3 +36,17 @@ def test_fusion_h5_round_trip(tmp_path: Path) -> None:
     restored = read_fusion_result(path)
     assert restored.shape == (rows, 18)
     np.testing.assert_array_equal(restored["speed_z"], 2.0)
+
+
+def test_batch_fusion_csv_is_viewer_compatible(tmp_path: Path) -> None:
+    path = tmp_path / "IMU_F5D10_outdoor.csv"
+    path.write_text(
+        "roll,yaw,pitch,acc_x,acc_y,acc_z,speed_x,speed_y,speed_z\n"
+        "0.1,0.2,0.3,0,0,0,0,0,0\n"
+        "0.2,0.3,0.4,0,0,0,0,0,0\n",
+        encoding="utf-8",
+    )
+    time_s, euler, quaternion = read_fusion_view_data(path)
+    np.testing.assert_allclose(time_s, [0.0, 0.01])
+    np.testing.assert_allclose(euler[0], [0.1, 0.2, 0.3])
+    np.testing.assert_allclose(np.linalg.norm(quaternion, axis=1), 1.0)

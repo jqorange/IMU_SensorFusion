@@ -4,15 +4,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import numpy as np
-import yaml
+
+# Change this single value to switch every direct-run entry point to another
+# recording. The name must match "<animal>D<day>_<environment>", for example
+# "F5D3_outdoor" or "F6D5_outdoor_2".
+ACTIVE_SESSION = "F6D9_outdoor"
+
+# Set the exact video for ACTIVE_SESSION. Update this path whenever the active
+# session changes; the resolver never scans directories to guess a video.
+VIDEO_FILE = Path(
+    r"I:\data\FieldRat\2024\F6\day9\F6_outdoor_medium\cam742024-09-19T18_00_13.avi"
+)
+
+# Set the exact behavior MAT containing the video timestamps for
+# ACTIVE_SESSION. Update this path together with ACTIVE_SESSION and VIDEO_FILE.
+TIMESTAMP_MAT_FILE = Path(
+    r"I:\data\FieldRat\2024\F6\Merged\day9\3E6_day9\3E6_day9.animal.behavior_corrected.mat"
+)
 
 _DEFAULT_MAPPING = (
     (0.0, 0.0, -1.0),
-    (0.0, 1, 0.0),
-    (1, 0, 0.0),
+    (0.0, -1.0, 0.0),
+    (-1, 0, 0.0),
 )
 
 
@@ -37,7 +52,7 @@ class FusionConfig:
     ekf_var_acc: float = 0.8**2
     # Smaller measurement variance means stronger magnetometer correction.
     # 0.3² trusts magnetic heading about 7.1x more than ahrs' 0.8² default.
-    ekf_var_mag: float = 0.8**2
+    ekf_var_mag: float = 0.05**2
     estimate_magnetic_dip: bool = True
     magnetometer_lowpass_hz: float = 2.0
     magnetometer_lowpass_order: int = 4
@@ -135,17 +150,3 @@ class FusionConfig:
     def ekf_variances(self) -> tuple[float, float, float]:
         """Return gyroscope, accelerometer, and magnetometer variances."""
         return self.ekf_var_gyro, self.ekf_var_acc, self.ekf_var_mag
-
-    @classmethod
-    def from_yaml(cls, path: str | Path) -> "FusionConfig":
-        """Load configuration from a YAML file."""
-        with Path(path).open("r", encoding="utf-8") as stream:
-            values: dict[str, Any] = yaml.safe_load(stream) or {}
-        for key in ("imu_channels_one_based", "clip_percentiles"):
-            if key in values:
-                values[key] = tuple(values[key])
-        if "sensor_axis_mapping" in values:
-            values["sensor_axis_mapping"] = tuple(
-                tuple(row) for row in values["sensor_axis_mapping"]
-            )
-        return cls(**values)

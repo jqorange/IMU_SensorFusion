@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 import threading
 from collections import OrderedDict
@@ -36,7 +37,11 @@ def _walk_mat(value: Any, prefix: str = "") -> list[tuple[str, np.ndarray]]:
 
 
 def load_video_timestamps(
-    mat_path: str | Path, expected_frames: int, key: str | None = None
+    mat_path: str | Path,
+    expected_frames: int,
+    key: str | None = None,
+    segment_index: int = 1,
+    gap_seconds: float = 60.0,
 ) -> tuple[np.ndarray, str]:
     """Load relative seconds from a MATLAB timestamp array.
 
@@ -54,6 +59,8 @@ def load_video_timestamps(
             raise KeyError(f"MAT key {key!r} was not found. Available arrays: {names}")
     if not candidates:
         raise ValueError(f"No one-dimensional timestamp arrays in {mat_path}.")
+    if segment_index < 1:
+        raise ValueError("Timestamp segment index must be at least 1.")
 
     def rank(item: tuple[str, np.ndarray]) -> tuple[int, int]:
         name, values = item
@@ -75,7 +82,102 @@ def load_video_timestamps(
         seconds = (datetimes - datetimes[0]).total_seconds().to_numpy()
     if not np.all(np.isfinite(seconds)) or np.any(np.diff(seconds) < 0.0):
         raise ValueError(f"Timestamp array {name!r} must be finite and monotonic.")
-    return seconds, name
+    breaks = np.flatnonzero(np.diff(seconds) > gap_seconds)
+    starts = np.concatenate(([0], breaks + 1))
+    stops = np.concatenate((breaks + 1, [len(seconds)]))
+    if segment_index > len(starts):
+        raise ValueError(
+            f"Timestamp array {name!r} has {len(starts)} segment(s); "
+            f"segment {segment_index} was requested."
+        )
+    start = int(starts[segment_index - 1])
+    stop = int(stops[segment_index - 1])
+    seconds = seconds[start:stop]
+    seconds = seconds - seconds[0]
+    if abs(len(seconds) - expected_frames) > 1:
+        raise ValueError(
+            f"Timestamp segment {segment_index} contains {len(seconds):,} values, "
+            f"but the video contains {expected_frames:,} frames."
+        )
+    return seconds, f"{name} [segment {segment_index}]"
+
+
+def load_dlc_positions(
+    csv_path: str | Path,
+    bodypart: str = "bodyCenter1",
+    min_likelihood: float = 0.5,
+) -> np.ndarray:
+    """Load and interpolate one DeepLabCut body part as framewise XY pixels."""
+    path = Path(csv_path)
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.reader(stream)
+        try:
+            _scorer = next(reader)
+            bodyparts = next(reader)
+            coordinates = next(reader)
+        except StopIteration as error:
+            raise ValueError(
+                f"DLC CSV must contain three header rows: {path}"
+            ) from error
+    if len(bodyparts) != len(coordinates):
+        raise ValueError(f"DLC header rows have different lengths: {path}")
+
+    column_by_coordinate = {
+        coordinate.strip().lower(): index
+        for index, (part, coordinate) in enumerate(zip(bodyparts, coordinates))
+        if part.strip() == bodypart
+    }
+    missing = {"x", "y"} - column_by_coordinate.keys()
+    if missing:
+        raise KeyError(
+            f"DLC body part {bodypart!r} is missing columns "
+            f"{sorted(missing)} in {path}."
+        )
+
+    frame_column = 0
+    x_column = column_by_coordinate["x"]
+    y_column = column_by_coordinate["y"]
+    likelihood_column = column_by_coordinate.get("likelihood")
+    selected_columns = [frame_column, x_column, y_column]
+    if likelihood_column is not None:
+        selected_columns.append(likelihood_column)
+    table = pd.read_csv(
+        path,
+        header=None,
+        skiprows=3,
+        usecols=selected_columns,
+        dtype=np.float64,
+    )
+    if table.empty:
+        raise ValueError(f"DLC CSV contains no frames: {path}")
+    frame_numbers = table[frame_column].to_numpy()
+    expected = np.arange(len(table), dtype=np.float64)
+    if not np.array_equal(frame_numbers, expected):
+        raise ValueError("DLC frame indices must be consecutive and start at zero.")
+
+    positions = table[[x_column, y_column]].to_numpy(dtype=np.float64, copy=True)
+    valid = np.all(np.isfinite(positions), axis=1)
+    if likelihood_column is not None:
+        likelihood = table[likelihood_column].to_numpy(dtype=np.float64)
+        valid &= np.isfinite(likelihood) & (likelihood >= min_likelihood)
+    if not np.any(valid):
+        raise ValueError(
+            f"No valid {bodypart!r} positions remain at likelihood "
+            f">= {min_likelihood:.3f}."
+        )
+
+    # Interpolation prevents low-confidence detections from making the crop
+    # jump away from the animal. Leading/trailing gaps use the nearest valid
+    # observation, matching numpy.interp boundary behavior.
+    frame_axis = np.arange(len(positions), dtype=np.float64)
+    valid_frames = frame_axis[valid]
+    for axis in range(2):
+        positions[:, axis] = np.interp(
+            frame_axis,
+            valid_frames,
+            positions[valid, axis],
+        )
+    return positions
 
 
 class _CleanupCartoonMouse3DWidget(QtWidgets.QWidget):
@@ -370,9 +472,7 @@ class CartoonMouse3DWidget(QtWidgets.QWidget):
             normal = QtCore.QPointF(-unit.y(), unit.x())
             base = endpoint - unit * 8.0
             painter.drawPolygon(
-                QtGui.QPolygonF(
-                    [endpoint, base + normal * 3.5, base - normal * 3.5]
-                )
+                QtGui.QPolygonF([endpoint, base + normal * 3.5, base - normal * 3.5])
             )
         painter.drawText(endpoint + QtCore.QPointF(4.0, -4.0), label)
 
@@ -393,6 +493,65 @@ class CartoonMouse3DWidget(QtWidgets.QWidget):
                 label,
             )
 
+    def _draw_reference_plane(
+        self,
+        painter: QtGui.QPainter,
+        center: QtCore.QPointF,
+        scale: float,
+    ) -> None:
+        """Draw a faint fixed world-horizontal plane behind the mouse."""
+        extent = 10.5
+        height = -5.2
+
+        def project(world: np.ndarray) -> QtCore.QPointF:
+            return QtCore.QPointF(
+                center.x() - scale * float(world @ self._screen_right),
+                center.y() - scale * float(world @ self._screen_up),
+            )
+
+        corners = np.array(
+            [
+                [-extent, -extent, height],
+                [extent, -extent, height],
+                [extent, extent, height],
+                [-extent, extent, height],
+            ]
+        )
+        painter.setPen(QtGui.QPen(QtGui.QColor(112, 184, 205, 38), 1.0))
+        painter.setBrush(QtGui.QColor(112, 184, 205, 18))
+        painter.drawPolygon(QtGui.QPolygonF([project(point) for point in corners]))
+        for coordinate in np.linspace(-extent, extent, 7):
+            painter.drawLine(
+                project(np.array([-extent, coordinate, height])),
+                project(np.array([extent, coordinate, height])),
+            )
+            painter.drawLine(
+                project(np.array([coordinate, -extent, height])),
+                project(np.array([coordinate, extent, height])),
+            )
+
+    def _draw_world_compass(self, painter: QtGui.QPainter) -> None:
+        """Draw fixed NED North and East directions in the model viewport."""
+        origin = QtCore.QPointF(self.width() - 52.0, self.height() - 48.0)
+        painter.setPen(QtGui.QPen(QtGui.QColor(220, 226, 235, 90), 1.0))
+        painter.setBrush(QtGui.QColor(8, 11, 16, 145))
+        painter.drawEllipse(origin, 35.0, 35.0)
+        for world_vector, color, label in (
+            (np.array([1.0, 0.0, 0.0]), "#f1fa8c", "N"),
+            (np.array([0.0, 1.0, 0.0]), "#ff9f43", "E"),
+        ):
+            vector = QtCore.QPointF(
+                -28.0 * float(world_vector @ self._screen_right),
+                -28.0 * float(world_vector @ self._screen_up),
+            )
+            self._draw_arrow(
+                painter,
+                origin,
+                vector,
+                QtGui.QColor(color),
+                label,
+            )
+
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
         del event
         painter = QtGui.QPainter(self)
@@ -400,6 +559,7 @@ class CartoonMouse3DWidget(QtWidgets.QWidget):
         painter.fillRect(self.rect(), QtGui.QColor("#11161f"))
         center = QtCore.QPointF(self.width() / 2.0, self.height() / 2.0 + 5.0)
         scale = min(self.width(), self.height()) / 24.0
+        self._draw_reference_plane(painter, center, scale)
 
         rotated = self._vertices @ self._matrix.T
         horizontal = -(rotated @ self._screen_right)
@@ -451,9 +611,7 @@ class CartoonMouse3DWidget(QtWidgets.QWidget):
                 lineType=cv2.LINE_8,
             )
         mask = raster[:, :, 3]
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(
             raster,
             contours,
@@ -471,6 +629,7 @@ class CartoonMouse3DWidget(QtWidgets.QWidget):
         )
         painter.drawImage(0, 0, image)
         self._draw_axis_inset(painter)
+        self._draw_world_compass(painter)
         painter.setPen(QtGui.QColor("#d8dee9"))
         painter.drawText(12, 22, "Procedural 3D cartoon mouse • opaque")
 
@@ -588,6 +747,152 @@ class FrameDecoder(QtCore.QThread):
             capture.release()
 
 
+class InteractiveVideoLabel(QtWidgets.QWidget):
+    """Zoomable video canvas centered automatically on a tracked position."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
+        self._pixmap = QtGui.QPixmap()
+        self._zoom = 1.0
+        self._focus_position: QtCore.QPointF | None = None
+        self._compass: list[tuple[QtCore.QPointF, QtGui.QColor, str]] = []
+
+    def setPixmap(self, pixmap: QtGui.QPixmap) -> None:  # noqa: N802
+        """Replace the current frame without changing the view transform."""
+        self._pixmap = pixmap
+        self.update()
+
+    def set_focus_position(self, x: float, y: float) -> None:
+        """Set the tracked source-pixel position used as the zoom center."""
+        self._focus_position = QtCore.QPointF(float(x), float(y))
+        self.update()
+
+    def set_compass(
+        self,
+        directions: list[tuple[QtCore.QPointF, QtGui.QColor, str]],
+    ) -> None:
+        """Set fixed overlay arrows in normalized screen coordinates."""
+        self._compass = directions
+        self.update()
+
+    def _fit_scale(self) -> float:
+        if self._pixmap.isNull():
+            return 1.0
+        return min(
+            self.width() / max(1, self._pixmap.width()),
+            self.height() / max(1, self._pixmap.height()),
+        )
+
+    def _display_size(self) -> QtCore.QSizeF:
+        scale = self._fit_scale() * self._zoom
+        return QtCore.QSizeF(
+            self._pixmap.width() * scale,
+            self._pixmap.height() * scale,
+        )
+
+    def _target_rect(self) -> QtCore.QRectF:
+        size = self._display_size()
+        center = QtCore.QPointF(self.width() / 2.0, self.height() / 2.0)
+        if self._focus_position is not None and self._zoom > 1.001:
+            scale = self._fit_scale() * self._zoom
+            return QtCore.QRectF(
+                center.x() - self._focus_position.x() * scale,
+                center.y() - self._focus_position.y() * scale,
+                size.width(),
+                size.height(),
+            )
+        return QtCore.QRectF(
+            center.x() - size.width() / 2.0,
+            center.y() - size.height() / 2.0,
+            size.width(),
+            size.height(),
+        )
+
+    def reset_view(self) -> None:
+        """Return to fit-to-window mode."""
+        self._zoom = 1.0
+        self.update()
+
+    @staticmethod
+    def _draw_arrow(
+        painter: QtGui.QPainter,
+        origin: QtCore.QPointF,
+        direction: QtCore.QPointF,
+        color: QtGui.QColor,
+        label: str,
+    ) -> None:
+        endpoint = origin + direction * 31.0
+        painter.setPen(QtGui.QPen(color, 3.0))
+        painter.setBrush(color)
+        painter.drawLine(origin, endpoint)
+        normal = QtCore.QPointF(-direction.y(), direction.x())
+        base = endpoint - direction * 8.0
+        painter.drawPolygon(
+            QtGui.QPolygonF([endpoint, base + normal * 3.5, base - normal * 3.5])
+        )
+        painter.drawText(endpoint + QtCore.QPointF(4.0, -4.0), label)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
+        del event
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform)
+        painter.fillRect(self.rect(), QtGui.QColor("#080b10"))
+        if not self._pixmap.isNull():
+            painter.drawPixmap(self._target_rect(), self._pixmap, self._pixmap.rect())
+
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        if self._compass:
+            origin = QtCore.QPointF(58.0, self.height() - 58.0)
+            painter.setPen(QtGui.QPen(QtGui.QColor(235, 239, 245, 130), 1.0))
+            painter.setBrush(QtGui.QColor(8, 11, 16, 150))
+            painter.drawEllipse(origin, 38.0, 38.0)
+            for direction, color, label in self._compass:
+                self._draw_arrow(painter, origin, direction, color, label)
+
+        if self._zoom > 1.001:
+            painter.setPen(QtGui.QColor(235, 239, 245, 210))
+            painter.setBrush(QtGui.QColor(8, 11, 16, 150))
+            badge = QtCore.QRectF(self.width() - 76.0, 12.0, 64.0, 25.0)
+            painter.drawRoundedRect(badge, 5.0, 5.0)
+            painter.drawText(
+                badge,
+                QtCore.Qt.AlignmentFlag.AlignCenter,
+                f"{self._zoom:.2f}×",
+            )
+        painter.end()
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802
+        if self._pixmap.isNull():
+            event.ignore()
+            return
+        steps = event.angleDelta().y() / 120.0
+        if steps == 0.0:
+            event.accept()
+            return
+        new_zoom = float(np.clip(self._zoom * (1.18**steps), 1.0, 8.0))
+        if np.isclose(new_zoom, self._zoom):
+            event.accept()
+            return
+        self._zoom = new_zoom
+        self.update()
+        event.accept()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.reset_view()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
 class FusionViewer(QtWidgets.QMainWindow):
     """Seekable synchronized video/fusion browser."""
 
@@ -598,6 +903,11 @@ class FusionViewer(QtWidgets.QMainWindow):
         timestamp_path: Path,
         timestamp_key: str | None,
         *,
+        timestamp_segment_index: int = 1,
+        timestamp_gap_seconds: float = 60.0,
+        tracking_path: Path | None = None,
+        tracking_bodypart: str = "bodyCenter1",
+        tracking_min_likelihood: float = 0.5,
         video_cache_megabytes: int = 512,
         video_prefetch_frames: int = 24,
         video_display_size: tuple[int, int] = (1000, 620),
@@ -605,6 +915,9 @@ class FusionViewer(QtWidgets.QMainWindow):
         cartoon_camera_azimuth_degrees: float = -37.5,
         cartoon_camera_elevation_degrees: float = 30.0,
         cartoon_world_yaw_alignment_degrees: float = 0.0,
+        video_compass_rotation_degrees: float = -90.0,
+        show_video_compass: bool = True,
+        initial_playback_fps: float | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle("IMU Fusion Inspector")
@@ -618,22 +931,63 @@ class FusionViewer(QtWidgets.QMainWindow):
             raise OSError(f"Cannot open video: {video_path}")
         self._frame_count = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
         self._video_fps = float(probe.get(cv2.CAP_PROP_FPS)) or 30.0
+        self._initial_playback_fps = (
+            self._video_fps
+            if initial_playback_fps is None
+            else float(initial_playback_fps)
+        )
+        self._video_frame_width = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._video_frame_height = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
         probe.release()
         self._timestamps, timestamp_name = load_video_timestamps(
-            timestamp_path, self._frame_count, timestamp_key
+            timestamp_path,
+            self._frame_count,
+            timestamp_key,
+            segment_index=timestamp_segment_index,
+            gap_seconds=timestamp_gap_seconds,
+        )
+        timestamp_duration = float(self._timestamps[-1] - self._timestamps[0])
+        self._timeline_fps = (
+            (len(self._timestamps) - 1) / timestamp_duration
+            if timestamp_duration > 0.0
+            else self._video_fps
         )
         self._available_frames = min(self._frame_count, len(self._timestamps))
+        self._tracking_positions: np.ndarray | None = None
+        if tracking_path is not None:
+            self._tracking_positions = load_dlc_positions(
+                tracking_path,
+                bodypart=tracking_bodypart,
+                min_likelihood=tracking_min_likelihood,
+            )
+            if len(self._tracking_positions) < self._available_frames:
+                raise ValueError(
+                    "DLC tracking has fewer frames than the synchronized video: "
+                    f"{len(self._tracking_positions):,} < {self._available_frames:,}."
+                )
         if self._available_frames <= 0:
             raise ValueError("Video and timestamp file have no usable frames.")
         self._frame_index = 0
         self._requested_frame_index = 0
         self._playing = False
+        self._slider_dragging = False
         self._plot_window_seconds = max(0.1, float(plot_window_seconds))
         self._cartoon_camera_azimuth_degrees = float(cartoon_camera_azimuth_degrees)
-        self._cartoon_camera_elevation_degrees = float(cartoon_camera_elevation_degrees)
+        self._cartoon_camera_elevation_degrees = float(
+            cartoon_camera_elevation_degrees
+        )
         self._cartoon_world_yaw_alignment_degrees = float(
             cartoon_world_yaw_alignment_degrees
         )
+        self._display_yaw_matrix = Rotation.from_euler(
+            "Z", self._cartoon_world_yaw_alignment_degrees, degrees=True
+        ).as_matrix()
+        video_compass_rotation = Rotation.from_euler(
+            "Z", float(video_compass_rotation_degrees), degrees=True
+        ).as_matrix()
+        self._video_compass_matrix = video_compass_rotation @ self._display_yaw_matrix
+        self._show_video_compass = bool(show_video_compass)
+        self._current_display_matrix = np.eye(3)
         self._last_frame: np.ndarray | None = None
         self._build_ui(timestamp_name, video_path.name)
         self._timer = QtCore.QTimer(self)
@@ -641,7 +995,7 @@ class FusionViewer(QtWidgets.QMainWindow):
         self._seek_timer = QtCore.QTimer(self)
         self._seek_timer.setSingleShot(True)
         self._seek_timer.setInterval(80)
-        self._seek_timer.timeout.connect(self._commit_slider_seek)
+        self._seek_timer.timeout.connect(self._request_slider_preview)
         self._pending_seek_index = 0
         self._decoder = FrameDecoder(
             video_path,
@@ -671,9 +1025,11 @@ class FusionViewer(QtWidgets.QMainWindow):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(8)
         top = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        self._video = QtWidgets.QLabel(alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+        self._video = InteractiveVideoLabel()
         self._video.setMinimumSize(720, 420)
-        self._video.setStyleSheet("background:#080b10; border-radius:6px")
+        self._video.setToolTip(
+            "Mouse wheel: zoom around bodyCenter1  |  Double-click: reset"
+        )
         top.addWidget(self._video)
         self._orientation = CartoonMouse3DWidget(
             self._cartoon_camera_azimuth_degrees,
@@ -730,17 +1086,21 @@ class FusionViewer(QtWidgets.QMainWindow):
         self._play = QtWidgets.QPushButton("▶ Play")
         self._play.clicked.connect(self._toggle_play)
         controls.addWidget(self._play)
-        previous = QtWidgets.QPushButton("◀ Frame")
-        previous.clicked.connect(lambda: self._show_frame(self._frame_index - 1))
-        controls.addWidget(previous)
-        following = QtWidgets.QPushButton("Frame ▶")
-        following.clicked.connect(lambda: self._show_frame(self._frame_index + 1))
-        controls.addWidget(following)
+        self._previous = QtWidgets.QPushButton("◀ Frame")
+        self._configure_frame_button(self._previous, -1)
+        controls.addWidget(self._previous)
+        self._following = QtWidgets.QPushButton("Frame ▶")
+        self._configure_frame_button(self._following, 1)
+        controls.addWidget(self._following)
         self._slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self._slider.setRange(0, max(0, self._available_frames - 1))
+        self._slider.sliderPressed.connect(self._begin_slider_drag)
         self._slider.sliderMoved.connect(self._schedule_slider_seek)
         self._slider.sliderReleased.connect(self._commit_slider_seek)
         controls.addWidget(self._slider, 1)
+        controls.addWidget(QtWidgets.QLabel("FPS"))
+        self._fps = self._create_fps_control()
+        controls.addWidget(self._fps)
         controls.addWidget(QtWidgets.QLabel("Speed"))
         self._speed = QtWidgets.QComboBox()
         self._speed.addItems(["0.25×", "0.5×", "1×", "2×", "4×"])
@@ -764,14 +1124,42 @@ class FusionViewer(QtWidgets.QMainWindow):
         root.addWidget(self._status)
         self.setCentralWidget(central)
 
+    def _configure_frame_button(
+        self, button: QtWidgets.QPushButton, direction: int
+    ) -> None:
+        """Make a frame button accelerate naturally while it is held."""
+        button.setAutoRepeat(True)
+        button.setAutoRepeatDelay(350)
+        button.setAutoRepeatInterval(35)
+        button.clicked.connect(lambda: self._step_frame(direction))
+
     def _speed_factor(self) -> float:
         return float(self._speed.currentText().removesuffix("×"))
+
+    def _create_fps_control(self) -> QtWidgets.QDoubleSpinBox:
+        """Create the editable playback frame-rate control."""
+        control = QtWidgets.QDoubleSpinBox()
+        control.setRange(1.0, 240.0)
+        control.setDecimals(2)
+        control.setSingleStep(1.0)
+        control.setKeyboardTracking(False)
+        control.setValue(self._initial_playback_fps)
+        control.setToolTip(
+            f"Playback frames per second (video source: {self._video_fps:.3f} FPS)"
+        )
+        control.valueChanged.connect(self._update_timer)
+        return control
+
+    def _playback_fps(self) -> float:
+        """Return the user-selected base playback frame rate."""
+        return float(self._fps.value())
 
     def _update_timer(self) -> None:
         if self._playing:
             self._play_anchor_time_s = self._timestamps[self._frame_index]
             self._play_clock.restart()
-        interval_ms = max(1, round(1000.0 / self._video_fps / self._speed_factor()))
+        effective_fps = self._playback_fps() * self._speed_factor()
+        interval_ms = max(1, round(1000.0 / effective_fps))
         if self._playing:
             self._timer.start(interval_ms)
 
@@ -786,8 +1174,11 @@ class FusionViewer(QtWidgets.QMainWindow):
             self._timer.stop()
 
     def _advance(self) -> None:
+        playback_time_scale = (
+            self._playback_fps() / self._timeline_fps * self._speed_factor()
+        )
         target_time = self._play_anchor_time_s + (
-            self._play_clock.elapsed() / 1000.0 * self._speed_factor()
+            self._play_clock.elapsed() / 1000.0 * playback_time_scale
         )
         target_index = int(np.searchsorted(self._timestamps, target_time))
         target_index = max(self._frame_index + 1, target_index)
@@ -796,14 +1187,37 @@ class FusionViewer(QtWidgets.QMainWindow):
             return
         self._show_frame(target_index)
 
+    def _begin_slider_drag(self) -> None:
+        """Freeze playback and prevent decoded frames from moving the thumb."""
+        self._slider_dragging = True
+        self._seek_timer.stop()
+        self._pending_seek_index = self._slider.value()
+        if self._playing:
+            self._toggle_play()
+
     def _schedule_slider_seek(self, requested: int) -> None:
-        """Debounce random seeks while the user drags the slider."""
+        """Preview fusion state and debounce video decoding during a drag."""
         self._pending_seek_index = int(requested)
+        # Invalidate any older decode immediately so it cannot repaint a stale
+        # frame while the thumb has already moved elsewhere.
+        self._requested_frame_index = self._pending_seek_index
+        self._update_fusion_overlay(self._pending_seek_index, render_video=False)
         self._seek_timer.start()
 
     def _commit_slider_seek(self) -> None:
         self._seek_timer.stop()
+        self._slider_dragging = False
         self._show_frame(self._pending_seek_index)
+
+    def _request_slider_preview(self) -> None:
+        """Decode a settled drag position without releasing the slider."""
+        self._show_frame(self._pending_seek_index)
+
+    def _step_frame(self, direction: int) -> None:
+        """Request the next frame relative to the latest outstanding request."""
+        if self._playing:
+            self._toggle_play()
+        self._show_frame(self._requested_frame_index + direction)
 
     def _show_frame(self, requested: int) -> None:
         index = int(np.clip(requested, 0, self._available_frames - 1))
@@ -813,13 +1227,18 @@ class FusionViewer(QtWidgets.QMainWindow):
     @QtCore.Slot(int, object)
     def _apply_frame(self, index: int, image: np.ndarray) -> None:
         """Apply decoded pixels and synchronized state on the main UI thread."""
-        if not self._playing and index != self._requested_frame_index:
+        if index != self._requested_frame_index:
             return
         self._last_frame = image
         self._frame_index = index
-        self._slider.blockSignals(True)
-        self._slider.setValue(index)
-        self._slider.blockSignals(False)
+        if not self._slider_dragging:
+            self._slider.blockSignals(True)
+            self._slider.setValue(index)
+            self._slider.blockSignals(False)
+        self._update_fusion_overlay(index)
+
+    def _render_video_frame(self, image: np.ndarray, frame_index: int) -> None:
+        """Scale a video frame and add a fixed world North/East compass."""
         qt_image = QtGui.QImage(
             image.data,
             image.shape[1],
@@ -827,15 +1246,43 @@ class FusionViewer(QtWidgets.QMainWindow):
             image.strides[0],
             QtGui.QImage.Format.Format_RGB888,
         )
-        pixmap = QtGui.QPixmap.fromImage(qt_image).scaled(
-            self._video.size(),
-            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-            QtCore.Qt.TransformationMode.FastTransformation,
-        )
+        pixmap = QtGui.QPixmap.fromImage(qt_image)
+        if self._tracking_positions is not None:
+            position = self._tracking_positions[frame_index]
+            scale_x = image.shape[1] / max(1, self._video_frame_width)
+            scale_y = image.shape[0] / max(1, self._video_frame_height)
+            self._video.set_focus_position(
+                position[0] * scale_x,
+                position[1] * scale_y,
+            )
+        compass: list[tuple[QtCore.QPointF, QtGui.QColor, str]] = []
+        if self._show_video_compass:
+            for world_vector, color, label in (
+                (np.array([1.0, 0.0, 0.0]), "#f1fa8c", "N"),
+                (np.array([0.0, 1.0, 0.0]), "#ff9f43", "E"),
+            ):
+                # The video camera is fixed in the world. Only the constant
+                # video-to-IMU yaw alignment rotates its compass.
+                display_world = self._video_compass_matrix @ world_vector
+                horizontal = display_world[:2]
+                norm = float(np.linalg.norm(horizontal))
+                if norm < 1e-9:
+                    continue
+                horizontal /= norm
+                compass.append(
+                    (
+                        QtCore.QPointF(
+                            float(horizontal[1]),
+                            -float(horizontal[0]),
+                        ),
+                        QtGui.QColor(color),
+                        label,
+                    )
+                )
+        self._video.set_compass(compass)
         self._video.setPixmap(pixmap)
-        self._update_fusion_overlay(index)
 
-    def _update_fusion_overlay(self, index: int) -> None:
+    def _update_fusion_overlay(self, index: int, *, render_video: bool = True) -> None:
         """Update plots and the 3D mouse without requesting a video decode."""
         fusion_time = self._timestamps[index] + self._offset.value()
         right = int(
@@ -877,7 +1324,10 @@ class FusionViewer(QtWidgets.QMainWindow):
             plot.setXRange(window_start, window_end, padding=0.0)
         q_wxyz = self._quaternion_aligned[imu_index]
         matrix = Rotation.from_quat(q_wxyz[[1, 2, 3, 0]]).as_matrix()
+        self._current_display_matrix = self._display_yaw_matrix @ matrix
         self._orientation.set_matrix(matrix)
+        if render_video and self._last_frame is not None:
+            self._render_video_frame(self._last_frame, index)
         angles_degrees = (np.rad2deg(self._euler[imu_index]) + 180.0) % 360.0 - 180.0
         for name, color, plot, value in zip(
             ("Roll", "Yaw", "Pitch"),
@@ -903,9 +1353,9 @@ class FusionViewer(QtWidgets.QMainWindow):
         if event.key() == QtCore.Qt.Key.Key_Space:
             self._toggle_play()
         elif event.key() == QtCore.Qt.Key.Key_Left:
-            self._show_frame(self._frame_index - 1)
+            self._step_frame(-1)
         elif event.key() == QtCore.Qt.Key.Key_Right:
-            self._show_frame(self._frame_index + 1)
+            self._step_frame(1)
         else:
             super().keyPressEvent(event)
 
@@ -926,6 +1376,13 @@ def _parse_args() -> argparse.Namespace:
         "--timestamp-key",
         help="Optional nested MAT key, e.g. behavior.timestamps_corrected",
     )
+    parser.add_argument(
+        "--tracking",
+        type=Path,
+        help="Optional DeepLabCut CSV used to center the zoomed video",
+    )
+    parser.add_argument("--tracking-bodypart", default="bodyCenter1")
+    parser.add_argument("--tracking-min-likelihood", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -939,6 +1396,9 @@ def main() -> None:
         args.video,
         args.timestamps,
         args.timestamp_key,
+        tracking_path=args.tracking,
+        tracking_bodypart=args.tracking_bodypart,
+        tracking_min_likelihood=args.tracking_min_likelihood,
     )
     window.show()
     raise SystemExit(app.exec())

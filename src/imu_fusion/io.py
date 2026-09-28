@@ -7,6 +7,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pandas as pd
+from scipy.spatial.transform import Rotation
 
 RAW_COLUMNS = (
     "acc_x_raw",
@@ -19,6 +20,19 @@ RAW_COLUMNS = (
     "mag_y_raw",
     "mag_z_raw",
 )
+
+BATCH_FUSION_CSV_COLUMNS = (
+    "roll",
+    "yaw",
+    "pitch",
+    "acc_x",
+    "acc_y",
+    "acc_z",
+    "speed_x",
+    "speed_y",
+    "speed_z",
+)
+BATCH_FUSION_CSV_SAMPLE_RATE_HZ = 100.0
 
 
 def read_analog_channels(
@@ -184,16 +198,36 @@ def read_fusion_view_data(
         "quaternion_aligned_y",
         "quaternion_aligned_z",
     ]
-    table = pd.read_csv(source, usecols=columns)
-    return (
-        table["time_s"].to_numpy(dtype=np.float64),
-        table[["roll", "yaw", "pitch"]].to_numpy(dtype=np.float32),
-        table[
-            [
-                "quaternion_aligned_w",
-                "quaternion_aligned_x",
-                "quaternion_aligned_y",
-                "quaternion_aligned_z",
-            ]
-        ].to_numpy(dtype=np.float32),
+    table = pd.read_csv(source)
+    if all(column in table.columns for column in columns):
+        return (
+            table["time_s"].to_numpy(dtype=np.float64),
+            table[["roll", "yaw", "pitch"]].to_numpy(dtype=np.float32),
+            table[
+                [
+                    "quaternion_aligned_w",
+                    "quaternion_aligned_x",
+                    "quaternion_aligned_y",
+                    "quaternion_aligned_z",
+                ]
+            ].to_numpy(dtype=np.float32),
+        )
+
+    if all(column in table.columns for column in BATCH_FUSION_CSV_COLUMNS):
+        euler = table[["roll", "yaw", "pitch"]].to_numpy(dtype=np.float64)
+        if not np.all(np.isfinite(euler)):
+            raise ValueError(f"Fusion Euler data contains non-finite values: {source}")
+        # Batch_sensor_fusion stores [roll, yaw, pitch] in radians. SciPy's
+        # ZYX convention consumes [yaw, pitch, roll] and returns xyzw.
+        quaternion_xyzw = Rotation.from_euler(
+            "ZYX", euler[:, [1, 2, 0]], degrees=False
+        ).as_quat()
+        quaternion_wxyz = quaternion_xyzw[:, [3, 0, 1, 2]]
+        time_s = np.arange(len(table), dtype=np.float64) / (
+            BATCH_FUSION_CSV_SAMPLE_RATE_HZ
+        )
+        return time_s, euler.astype(np.float32), quaternion_wxyz.astype(np.float32)
+
+    raise ValueError(
+        f"Fusion CSV does not contain the expected viewer columns: {source}"
     )
